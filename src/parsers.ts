@@ -18,6 +18,18 @@ import { standardTypes } from "./types";
 import _ from "lodash";
 // @ts-expect-error moduleResolution:nodenext issue 54523
 import { VineValidator } from "@vinejs/vine";
+import * as stateManager from "./stateManager";
+import path from "path";
+import "reflect-metadata";
+
+const standardizationType = (type) => {
+  const regex = /^Array<(.+)>$/;
+  const match = type.match(regex);
+  if (match) {
+    return `${match[1]}[]`;
+  }
+  return type;
+};
 
 export class CommentParser {
   private parsedFiles: { [file: string]: string } = {};
@@ -127,6 +139,35 @@ export class CommentParser {
         const common = this.options.common.parameters[u];
         h = [...h, ...common];
       });
+
+      const schemaRegex = /<([^>]+)>/g;
+      const matches = [...line.matchAll(schemaRegex)];
+      const schemas = [];
+
+      const validators = stateManager.getState("validators");
+
+      matches.forEach((match) => {
+        const schemaName = match[1];
+        const validator = validators[schemaName];
+
+        if (validator && validator.properties) {
+          Object.keys(validator.properties).forEach((propertyName) => {
+            const property = validator.properties[propertyName];
+            const schema = {
+              in: "query",
+              name: propertyName,
+              required: property.required,
+              properties: property.properties,
+              example: property.example,
+            };
+            schemas.push(schema);
+          });
+        }
+      });
+
+      if (schemas.length > 0) {
+        h = [...h, ...schemas];
+      }
 
       return h;
     }
@@ -270,7 +311,8 @@ export class CommentParser {
 
   private parseRequestFormDataBody(rawLine: string) {
     const line = rawLine.replace("@requestFormDataBody ", "");
-    let json = {}, required = [];
+    let json = {},
+      required = [];
     const isJson = isJSONString(line);
     if (!isJson) {
       // try to get json from reference
@@ -284,7 +326,8 @@ export class CommentParser {
       let props = [];
       const ref = this.exampleGenerator.schemas[cleandRef];
       const ks = [];
-      if (ref.required && Array.isArray(ref.required)) required.push(...ref.required)
+      if (ref.required && Array.isArray(ref.required))
+        required.push(...ref.required);
       Object.entries(ref.properties).map(([key, value]) => {
         if (typeof parsedRef[key] === "undefined") {
           return;
@@ -314,9 +357,9 @@ export class CommentParser {
       json = JSON.parse(line);
       for (let key in json) {
         if (json[key].required === "true") {
-          required.push(key)
+          required.push(key);
         }
-    }
+      }
     }
     // No need to try/catch this JSON.parse as we already did that in the isJSONString function
 
@@ -430,8 +473,47 @@ export class CommentParser {
 
   async getAnnotations(file: string, action: string) {
     let annotations = {};
-    let newdata = "";
+    // let newdata = "";
     if (typeof file === "undefined") return;
+
+    try {
+      const absolutePath = path.resolve(file);
+
+      const controllerModule = await import(absolutePath);
+      const ControllerClass = controllerModule.default;
+
+      const swaggerComment = Reflect.getMetadata(
+        "swaggerComment",
+        ControllerClass.prototype,
+        action
+      );
+
+      if (swaggerComment) {
+        annotations[action] = this.parseSwaggerComment(swaggerComment);
+      } else {
+        annotations = await this.parseFileForAnnotations(file, action);
+      }
+    } catch (error) {
+      console.error(`Error processing file ${file}:`, error);
+      annotations = await this.parseFileForAnnotations(file, action);
+    }
+
+    return annotations;
+  }
+
+  private parseSwaggerComment(comment: string) {
+    const lines = comment
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("*"))
+      .map((line) => line.substring(1).trim());
+
+    return this.parseAnnotations(lines);
+  }
+
+  private async parseFileForAnnotations(file: string, action: string) {
+    let annotations = {};
+    let newdata = "";
 
     if (typeof this.parsedFiles[file] !== "undefined") {
       newdata = this.parsedFiles[file];
@@ -459,6 +541,7 @@ export class CommentParser {
         annotations[action] = this.parseAnnotations(lines);
       });
     }
+
     return annotations;
   }
 }
@@ -556,6 +639,8 @@ export class ModelParser {
       )
         return;
 
+      if (line.startsWith("public ") && line.includes("()")) return;
+
       let s = [];
 
       if (line.includes("declare ")) {
@@ -574,7 +659,7 @@ export class ModelParser {
 
       let field = s2[0];
       let type = s2[1];
-      type = type.trim();
+      type = type?.trim();
       let enums = [];
       let format = "";
       let keyprops = {};
@@ -626,9 +711,9 @@ export class ModelParser {
         format = "";
       }
 
-      field = field.trim();
+      field = field?.trim();
 
-      type = type.trim();
+      type = type?.trim();
 
       //TODO: make oneOf
       if (type.includes(" | ")) {
@@ -660,13 +745,26 @@ export class ModelParser {
           type = type.toLowerCase();
         } else {
           // assume its a custom interface
-          indicator = "$ref";
-          type = "#/components/schemas/" + type;
+          const stateEnums = stateManager.getState("enums");
+          if (stateEnums.hasOwnProperty(type)) {
+            const temp = stateEnums[type];
+            const result = Object.values(temp)
+              .map((value) => `- ${value}`)
+              .join("\n");
+            type = "string";
+            enums = result as any;
+          } else {
+            type = standardizationType(type);
+            if (!standardTypes.includes(type.toLowerCase())) {
+              indicator = "$ref";
+              type = "#/components/schemas/" + type;
+            }
+          }
         }
       }
-      type = type.trim();
+      type = type?.trim();
       let isArray = false;
-
+      type = type.replace(/Array<([A-Za-z0-9_]+)>/g, "$1[]");
       if (
         line.includes("HasMany") ||
         line.includes("ManyToMany") ||
@@ -758,6 +856,108 @@ export class ValidatorParser {
   constructor() {
     this.exampleGenerator = new ExampleGenerator({});
   }
+
+  parseValidatorProperties(data) {
+    const properties = {};
+    const schemaRegex =
+      /public\s+schema\s*=\s*schema\.create\(\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}\)/g;
+    const match = data.match(schemaRegex);
+
+    if (match) {
+      const schemaContent = match[0];
+      const propertyRegex =
+        /(\w+):\s*schema\.([\w.]+)(?:\.(\w+))?\(([\s\S]*?)\)/g;
+      let propertyMatch;
+
+      while ((propertyMatch = propertyRegex.exec(schemaContent)) !== null) {
+        const [, name, content, , options] = propertyMatch;
+        const [type, modifier] = content.split(".");
+
+        properties[name] = {
+          type: this.mapType(type),
+          nullable:
+            modifier === "nullable" || modifier === "nullableAndOptional",
+          required: modifier === "required",
+          example: this.exampleGenerator.exampleByType(type),
+        };
+
+        if (options) {
+          const formatMatch = options.match(/format:\s*['"]([^'"]*)['"]/);
+          if (formatMatch) {
+            properties[name].format = formatMatch[1];
+          }
+
+          const minMatch = options.match(/min:\s*([0-9]+)/);
+          if (minMatch) {
+            properties[name].minimum = parseInt(minMatch[1]);
+          }
+
+          const maxMatch = options.match(/max:\s*([0-9]+)/);
+          if (maxMatch) {
+            properties[name].maximum = parseInt(maxMatch[1]);
+          }
+
+          const rulesMatch = options.match(
+            /\[\s*rules\.\w+\(\{[\s\S]*?\}\)\s*\]/g
+          );
+          if (rulesMatch) {
+            properties[name].rules = rulesMatch.map((rule) =>
+              this.parseRules(rule)
+            );
+          }
+        }
+        properties[name].description = `${name} field`;
+      }
+    }
+
+    return properties;
+  }
+
+  mapType(type) {
+    const typeMap = {
+      string: "string",
+      number: "number",
+      boolean: "boolean",
+      date: "string",
+      object: "object",
+      array: "array",
+    };
+
+    return typeMap[type] || "string";
+  }
+
+  parseRules(rulesString) {
+    const rules = {};
+    const ruleRegex = /(\w+):\s*['"]?([^,'"]+)['"]?/g;
+    let ruleMatch;
+
+    while ((ruleMatch = ruleRegex.exec(rulesString)) !== null) {
+      const [, key, value] = ruleMatch;
+      rules[key] = value;
+    }
+    return rules;
+  }
+
+  parseValidatorRequired(data) {
+    const required = [];
+    const schemaRegex =
+      /public\s+schema\s*=\s*schema\.create\s*\(\s*{([^}]*)}\s*\)/s;
+    const match = data.match(schemaRegex);
+
+    if (match) {
+      const schemaContent = match[1];
+      const propertyRegex =
+        /(\w+):\s*schema\.([\w.]+)(?!\.optional|\.\w*Optional)/g;
+      let propertyMatch;
+
+      while ((propertyMatch = propertyRegex.exec(schemaContent)) !== null) {
+        required.push(propertyMatch[1]);
+      }
+    }
+
+    return required;
+  }
+
   async validatorToObject(validator: VineValidator<any, any>) {
     // console.dir(validator.toJSON()["refs"], { depth: null });
     // console.dir(json, { depth: null });
@@ -924,7 +1124,7 @@ export class ValidatorParser {
                 : this.exampleGenerator.exampleByType("number"),
               ...meta,
             };
-      if(!p["isOptional"]) obj[p["fieldName"]]["required"] = true;
+      if (!p["isOptional"]) obj[p["fieldName"]]["required"] = true;
     }
     return obj;
   }
@@ -976,11 +1176,26 @@ export class InterfaceParser {
 
   parseType(type, field) {
     let isArray = false;
+
+    // Handle array types
     if (type.includes("[]")) {
       type = type.replace("[]", "");
       isArray = true;
     }
-    let prop: any = { type: type };
+
+    const matchArray = type.match(/^Array<(.+)>$/);
+    if (matchArray) {
+      type = matchArray[1];
+      isArray = true;
+    }
+
+    // Split the type by union separator
+    const types = type
+      .split("|")
+      .map((t) => t.trim())
+      .filter((t) => t !== "null" && t !== "undefined");
+
+    let prop = {};
     let meta = "";
     let en = getBetweenBrackets(meta, "enum");
     let example = getBetweenBrackets(meta, "example");
@@ -988,40 +1203,62 @@ export class InterfaceParser {
     if (example === "") {
       example = this.exampleGenerator.exampleByField(field);
     }
-
     if (example === null) {
-      example = this.exampleGenerator.exampleByType(type);
+      example = this.exampleGenerator.exampleByType(types[0]); // Use the first type for example generation
     }
-
     if (en !== "") {
       enums = en.split(",");
       example = enums[0];
     }
-    let indicator = "type";
     let notRequired = field.includes("?");
-
     prop["nullable"] = notRequired;
-    if (type.toLowerCase() === "datetime") {
-      prop[indicator] = "string";
-      prop["format"] = "date-time";
-      prop["example"] = "2021-03-23T16:13:08.489+01:00";
-    } else if (type.toLowerCase() === "date") {
-      prop[indicator] = "string";
-      prop["format"] = "date";
-      prop["example"] = "2021-03-23";
-    } else {
-      if (!standardTypes.includes(type)) {
-        indicator = "$ref";
-        type = "#/components/schemas/" + type;
-      }
 
-      prop[indicator] = type;
-      prop["example"] = example;
-      prop["nullable"] = notRequired;
+    // Handle multiple types
+    if (types.length > 1) {
+      prop["oneOf"] = types.map((t) => {
+        let subProp = { type: t };
+        if (t.toLowerCase() === "datetime") {
+          subProp["type"] = "string";
+          subProp["format"] = "date-time";
+          subProp["example"] = "2021-03-23T16:13:08.489+01:00";
+        } else if (t.toLowerCase() === "date") {
+          subProp["type"] = "string";
+          subProp["format"] = "date";
+          subProp["example"] = "2021-03-23";
+        } else {
+          if (!standardTypes.includes(t)) {
+            subProp["$ref"] = "#/components/schemas/" + t;
+          } else {
+            subProp["type"] = t;
+          }
+          subProp["example"] = example;
+        }
+        return subProp;
+      });
+    } else {
+      let t = types[0];
+      if (t.toLowerCase() === "datetime") {
+        prop["type"] = "string";
+        prop["format"] = "date-time";
+        prop["example"] = "2021-03-23T16:13:08.489+01:00";
+      } else if (t.toLowerCase() === "date") {
+        prop["type"] = "string";
+        prop["format"] = "date";
+        prop["example"] = "2021-03-23";
+      } else {
+        if (!standardTypes.includes(t)) {
+          prop["$ref"] = "#/components/schemas/" + t;
+        } else {
+          prop["type"] = t;
+        }
+        prop["example"] = example;
+      }
     }
+
     if (isArray) {
       prop = { type: "array", items: prop };
     }
+
     return prop;
   }
 
@@ -1034,6 +1271,10 @@ export class InterfaceParser {
     const l = data.split("\n");
     let ifs = {};
     l.forEach((line, index) => {
+      if (line.includes("{") && !line.includes("export")) {
+        return;
+      }
+
       if (line.includes(";")) {
         line = line.replace(";", "");
       }
@@ -1041,7 +1282,8 @@ export class InterfaceParser {
         line.startsWith("//") ||
         line.startsWith("/*") ||
         line.startsWith("import") ||
-        line.startsWith("*")
+        line.startsWith("*") ||
+        line.includes("extends")
       )
         return;
       if (
@@ -1061,37 +1303,55 @@ export class InterfaceParser {
         return;
       }
 
-      let nl = line;
+      if (line.includes("[key:")) {
+        const valueType = line
+          .split(":")[1]
+          .trim()
+          .replace(";", "")
+          .replace("]", "");
 
-      let [f, t] = line.split(": ");
-      if (f && t) {
-        if (f.startsWith("'") && f.endsWith("'")) {
-          f = f.replaceAll("'", '"');
-        }
-        if (!f.startsWith('"') && !f.endsWith('"')) {
-          f = `"${f}"`;
-        }
+        ifs[name] += `"additionalProperties": {"type": "${valueType}"},`;
+      } else {
+        let nl = line;
 
-        let comma = "";
-        if (!t.endsWith("{")) {
-          if (l[index + 1] !== "}") {
-            comma = ",";
+        let [f, t] = line.split(": ");
+        if (f && t) {
+          if (f.startsWith("'") && f.endsWith("'")) {
+            f = f.replaceAll("'", '"');
           }
-          t = `"${t}"`;
+          if (!f.startsWith('"') && !f.endsWith('"')) {
+            f = `"${f}"`;
+          }
+
+          let comma = "";
+          if (!t.endsWith("{")) {
+            if (l[index + 1] !== "}") {
+              comma = ",";
+            }
+            t = `"${t}"`;
+          }
+          nl = `${f}: ${t}${comma}`;
         }
-        nl = `${f}: ${t}${comma}`;
+        ifs[name] += nl;
       }
-      ifs[name] += nl;
     });
 
     for (const [n, value] of Object.entries(ifs)) {
       try {
         let j = JSON.parse(value as string);
-        ifs[n] = {
-          type: "object",
-          properties: this.parseProps(j),
-          description: n + " (Interface)",
-        };
+        if (j.additionalProperties) {
+          ifs[n] = {
+            type: "object",
+            additionalProperties: j.additionalProperties,
+            description: n + " (Interface with dynamic keys)",
+          };
+        } else {
+          ifs[n] = {
+            type: "object",
+            properties: this.parseProps(j),
+            description: n + " (Interface)",
+          };
+        }
       } catch (e) {
         ifs[n] = {};
       }

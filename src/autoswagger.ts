@@ -22,6 +22,7 @@ import { mergeParams, formatOperationId } from "./helpers";
 import ExampleGenerator, { ExampleInterfaces } from "./example";
 // @ts-expect-error moduleResolution:nodenext issue 54523
 import { VineValidator } from "@vinejs/vine";
+import * as stateManager from "./stateManager";
 
 export class AutoSwagger {
   private options: options;
@@ -582,12 +583,76 @@ export class AutoSwagger {
 
     schemas = {
       ...schemas,
+      ...(await this.getConstants()),
       ...(await this.getInterfaces()),
       ...(await this.getModels()),
       ...(await this.getValidators()),
     };
 
     return schemas;
+  }
+
+  private async getConstants() {
+    let constants = {};
+
+    let p = path.join(this.options.appPath, "Constants");
+    let p6 = path.join(this.options.appPath, "constants");
+
+    if (typeof this.customPaths["#constants"] !== "undefined") {
+      // it's v6
+      p6 = p6.replaceAll("app/constants", this.customPaths["#constants"]);
+      p6 = p6.replaceAll("app\\constants", this.customPaths["#constants"]);
+    }
+
+    if (!existsSync(p) && !existsSync(p6)) {
+      if (this.options.debug) {
+        console.log("Interface paths don't exist", p, p6);
+      }
+      return constants;
+    }
+    if (existsSync(p6)) {
+      p = p6;
+    }
+    const files = await this.getFiles(p, []);
+    if (this.options.debug) {
+      console.log("Found interfaces files", files);
+    }
+    const readFile = util.promisify(fs.readFile);
+    for (let file of files) {
+      file = file.replace(".js", "");
+      const data = await readFile(file, "utf8");
+      this.extractEnums(data);
+    }
+
+    return constants;
+  }
+
+  private extractEnums(data: string) {
+    const enumRegex = /enum\s+(\w+)\s*{([^}]*)}/g;
+    const enums = {};
+    let match;
+
+    while ((match = enumRegex.exec(data)) !== null) {
+      const enumName = match[1];
+      const enumBody = match[2];
+      const enumValues = {};
+
+      enumBody.split(",").forEach((line) => {
+        const [key, value] = line
+          .split("=")
+          .map((part) => part.trim().replace(/['"]/g, ""));
+        if (key && value) {
+          enumValues[key] = value;
+        }
+      });
+      enums[enumName] = enumValues;
+
+      stateManager.setState("enums", {
+        ...stateManager.getState("enums"),
+        [enumName]: enumValues,
+      });
+    }
+    return enums;
   }
 
   private async getValidators() {
@@ -686,30 +751,30 @@ export class AutoSwagger {
   }
 
   private async getInterfaces() {
-    let interfaces = {
+    let types = {
       ...ExampleInterfaces.paginationInterface(),
     };
-    let p = path.join(this.options.appPath, "Interfaces");
-    let p6 = path.join(this.options.appPath, "interfaces");
+    let p = path.join(this.options.appPath, "Types");
+    let p6 = path.join(this.options.appPath, "types");
 
-    if (typeof this.customPaths["#interfaces"] !== "undefined") {
+    if (typeof this.customPaths["#types"] !== "undefined") {
       // it's v6
-      p6 = p6.replaceAll("app/interfaces", this.customPaths["#interfaces"]);
-      p6 = p6.replaceAll("app\\interfaces", this.customPaths["#interfaces"]);
+      p6 = p6.replaceAll("app/types", this.customPaths["#types"]);
+      p6 = p6.replaceAll("app\\types", this.customPaths["#types"]);
     }
 
     if (!existsSync(p) && !existsSync(p6)) {
       if (this.options.debug) {
         console.log("Interface paths don't exist", p, p6);
       }
-      return interfaces;
+      return types;
     }
     if (existsSync(p6)) {
       p = p6;
     }
     const files = await this.getFiles(p, []);
     if (this.options.debug) {
-      console.log("Found interfaces files", files);
+      console.log("Found types files", files);
     }
     const readFile = util.promisify(fs.readFile);
     for (let file of files) {
@@ -719,13 +784,13 @@ export class AutoSwagger {
       const split = file.split("/");
       const name = split[split.length - 1].replace(".ts", "");
       file = file.replace("app/", "/app/");
-      interfaces = {
-        ...interfaces,
+      types = {
+        ...types,
         ...this.interfaceParser.parseInterfaces(data),
       };
     }
 
-    return interfaces;
+    return types;
   }
 
   private async getFiles(dir, files_) {
